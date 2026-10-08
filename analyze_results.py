@@ -18,6 +18,8 @@ ups = np.array(sorted(set(pat)))
 folds = []
 for tr, te in KFold(5, shuffle=True, random_state=A.seed).split(ups):
     folds.append(np.where(np.isin(pat, ups[te]))[0])
+fold_of = np.zeros(len(y), int)
+for i_, te_ in enumerate(folds): fold_of[te_] = i_ + 1
 runs = {}
 for fn in sorted(glob.glob(os.path.join(A.data_dir, "lesion_oof_*.npz"))):
     if "quick" in fn: continue
@@ -57,6 +59,44 @@ for i in range(len(ks)):
         S["diff"][f"{b}-{a}"]={"delta":float(roc_auc_score(y,runs[b])-roc_auc_score(y,runs[a])),"ci":boot(f)}
 S["cohort"]={"n_pat":len(ups),"n":len(y),"pos":int(y.sum()),"fold_pats":[sorted(set(pat[te])) for te in folds],
   "fold_n":[int(len(te)) for te in folds],"fold_pos":[int(y[te].sum()) for te in folds]}
+
+# ---- extended analyses (position, operating points, per-fold confusion, per-patient, ICC)
+rel=m.groupby(["patient","series_tail"]).z_index.transform(lambda s:(s-s.min())/max(s.max()-s.min(),1)).values
+edges=[0,0.2,0.4,0.6,0.8,1.0001]; S["position_labels"]=["0-20%","20-40%","40-60%","60-80%","80-100%"]
+bin_of=np.digitize(rel,edges[1:-1])
+S["position_n"]=[int((bin_of==b).sum()) for b in range(5)]; S["position_prev"]=[float(y[bin_of==b].mean()) for b in range(5)]
+S["position"]={}
+for k,p in runs.items():
+    S["position"][k]={"sens":[float((p[(bin_of==b)&(y==1)]>=.5).mean()) for b in range(5)],"spec":[float((p[(bin_of==b)&(y==0)]<.5).mean()) for b in range(5)],
+                       "auc":[float(roc_auc_score(y[bin_of==b],p[bin_of==b])) for b in range(5)]}
+def sens_at_spec(ix,p,sp=0.90):
+    fpr,tpr,_=roc_curve(y[ix],p[ix]); return float(tpr[fpr<=1-sp].max())
+def spec_at_sens(ix,p,se=0.90):
+    fpr,tpr,_=roc_curve(y[ix],p[ix]); return float(1-fpr[tpr>=se].min())
+S["op"]={}
+allix=np.arange(len(y))
+for k,p in runs.items():
+    S["op"][k]={"sens_at_90spec":sens_at_spec(allix,p),"sens_at_90spec_ci":boot(lambda ix:sens_at_spec(ix,p),n=1000),
+                "spec_at_90sens":spec_at_sens(allix,p),"spec_at_90sens_ci":boot(lambda ix:spec_at_sens(ix,p),n=1000)}
+S["fold_conf"]={}
+for k,p in runs.items():
+    r=[]
+    for te in folds:
+        pr=p[te]>=.5; yy=y[te]; r.append([int((pr&(yy==1)).sum()),int((pr&(yy==0)).sum()),int((~pr&(yy==1)).sum()),int((~pr&(yy==0)).sum())])
+    S["fold_conf"][k]=r
+pp=[]
+for u in ups:
+    ix=idx_by[u]; row={"patient":u,"n":int(len(ix)),"pos":int(y[ix].sum()),"kvp":int(m.kvp.values[ix][0]),"thk":float(m.slice_thickness.values[ix][0]),"fold":int(fold_of[ix][0])}
+    for k,p in runs.items():
+        row[k]={"auc":float(roc_auc_score(y[ix],p[ix])),"sens":float((p[ix][y[ix]==1]>=.5).mean()),"spec":float((p[ix][y[ix]==0]<.5).mean())}
+    pp.append(row)
+S["per_patient"]=pp
+# intraclass correlation of the label within patients (one-way ANOVA) and design effect
+ns=np.array([len(idx_by[u]) for u in ups]); N=ns.sum(); k_=len(ups); means=np.array([y[idx_by[u]].mean() for u in ups]); gm=y.mean()
+msb=(ns*(means-gm)**2).sum()/(k_-1); msw=sum(((y[idx_by[u]]-means[i])**2).sum() for i,u in enumerate(ups))/(N-k_)
+m0=(N-(ns**2).sum()/N)/(k_-1); icc=(msb-msw)/(msb+(m0-1)*msw); deff=1+(ns.mean()-1)*icc
+S["icc"]={"icc":float(icc),"design_effect":float(deff),"effective_n":float(N/deff),"mean_cluster":float(ns.mean())}
+
 json.dump(S, open(os.path.join(A.out_dir, "stats.json"), "w"), indent=1, default=float)
 for k,d in S["models"].items(): print(k, round(d["auc"],3),[round(x,3) for x in d["auc_ci"]],round(d["ap"],3),round(d["sens"],3),round(d["spec"],3),"brier",round(d["brier"],3))
 print(S["folds"], S["diff"], S["cohort"]["fold_n"], S["cohort"]["fold_pos"])
@@ -115,6 +155,17 @@ for i in range(2):
     for j in range(2): d.text(j,i,f"{cm[i,j]}\n({cm[i,j]/cm[i].sum()*100:.0f}%)",ha="center",va="center",color="white" if cm[i,j]>cm.max()/2 else "black",fontsize=9)
 d.set_xticks([0,1]); d.set_xticklabels(["pred. absent","pred. present"]); d.set_yticks([0,1]); d.set_yticklabels(["true absent","true present"]); d.set_title(f"D  Confusion ({NAMES[k0]})",loc="left",fontsize=9,fontweight="bold")
 plt.tight_layout(); save(fig,"Fig5_diagnostics")
+
+# ---------- Fig 7 position within the liver
+fig,ax=plt.subplots(1,2,figsize=(8.2,3.2)); a=ax[0]
+a.bar(range(5),S["position_prev"],color="#D55E00",width=0.6); a.set_xticks(range(5)); a.set_xticklabels([f"{l}\n(n={n})" for l,n in zip(S["position_labels"],S["position_n"])],fontsize=7.5)
+a.set_ylim(0,1); a.set_ylabel("Fraction of slices with tumour"); a.set_xlabel("Relative position within the liver (inferior → superior)"); a.set_title("A  Tumour prevalence by position",loc="left",fontsize=9,fontweight="bold")
+b=ax[1]; w=0.8/max(len(runs),1)
+for i,(k,p) in enumerate(runs.items()):
+    b.plot(range(5),S["position"][k]["sens"],"o-",c=COL[k],lw=1.5,ms=4,label=NAMES[k]+" sens."); b.plot(range(5),S["position"][k]["spec"],"s--",c=COL[k],lw=1.2,ms=3.5,label=NAMES[k]+" spec.")
+b.set_xticks(range(5)); b.set_xticklabels(S["position_labels"],fontsize=7.5); b.set_ylim(0,1); b.set_xlabel("Relative position within the liver"); b.set_ylabel("Sensitivity / specificity at 0.5"); b.legend(frameon=False,fontsize=6.5,ncol=1); b.set_title("B  Performance by position",loc="left",fontsize=9,fontweight="bold")
+plt.tight_layout(); save(fig,"Fig7_position")
+
 # ---------- Fig 6 per-fold + size
 fig,ax=plt.subplots(1,2,figsize=(8.2,3.2)); a=ax[0]; w=0.8/len(runs)
 for i,(k,v) in enumerate(S["folds"].items()): a.bar(np.arange(5)+i*w-0.4+w/2,v,w,color=COL[k],label=NAMES[k])
